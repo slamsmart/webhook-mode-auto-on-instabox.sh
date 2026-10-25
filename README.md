@@ -2,6 +2,8 @@
 
 Bangunin bot Telegram kamu secara otomatis pas VPS instabox lagi tidur — tanpa perlu polling, tanpa buang kuota run budget.
 
+> **Untuk agent / LLM:** pakai [`SKILL.md`](./SKILL.md) — versi instruksi yang bisa langsung dimuat (frontmatter + langkah verifikasi + pitfalls). README ini untuk manusia.
+
 ## Masalah
 
 Instabox sandbox punya fitur **idle auto-suspend**: kalau 30 menit nggak ada aktivitas, mesinnya pause otomatis. Masalahnya, Hermes Agent gateway pake **long polling** secara default — bot nanya ke Telegram tiap beberapa detik "ada pesan baru?". Begitu mesin pause, polling berhenti, dan bot jadi **bisu**. Pesan yang dikirim ke bot hilang tanpa dibaca.
@@ -115,8 +117,35 @@ Polling jadi mode default kalau `TELEGRAM_WEBHOOK_URL` tidak diset.
 | Mesin aktif, kamu kirim pesan | Balasan langsung (sama kayak polling) |
 | Mesin idle-pause, kamu kirim pesan | Balasan pertama agak lambat (~5-15 dtk), sisanya normal |
 | Mesin distop (bukan pause) | 503 dari URL publik — start manual dulu |
-| Budget run habis | Sama kayak distop — start run baru |
+| Budget run habis (plan free: `maxRunMinutes` 480) | Mesin pause + **cooldown ~10 menit**; selama cooldown semua jalur wake ditolak (`409 machine_cooldown` + `Retry-After`). Setelah cooldown lewat, **pesan berikutnya membangunkan mesin lagi** (tidak perlu start manual). Resume juga me-reset jam max-run, jadi jendela 8 jam mulai dari nol lagi |
 | Orang iseng nemu URL webhook kamu | Tanpa secret token, Telegram tolak POST-nya sebelum sampai ke gateway |
+
+## Cek Sehat Cepat — bedakan tiap kode HTTP
+
+Jalankan dari mesin lain (atau dari dalam mesin sendiri):
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://8443-<machine-id>.instabox.tech/telegram
+```
+
+| Kode | Artinya | Aksi |
+|------|---------|------|
+| **405** | ✅ Webhook server hidup (menolak GET, cuma terima POST) | Normal, tidak ada yang perlu diperbaiki |
+| **502** | Port dipublish, tapi **tidak ada yang listen** — gateway masih long polling atau mati | Restart gateway: `systemctl --user restart hermes-gateway.service`, lalu cek log |
+| **503** | Mesin di-pause/di-stop **manual** → tidak akan bangun sendiri | `start`/`resume` mesin; hanya idle auto-pause yang bangun saat dikunjungi |
+
+Cek dari sisi Telegram & dari dalam mesin:
+
+```bash
+# status registrasi webhook
+curl -s "https://api.telegram.org/bot${TOKEN}/getWebhookInfo" \
+  | jq '.result | {url, pending_update_count, last_error_message}'
+#    → url benar, pending 0, last_error null
+
+# listener & mode gateway di dalam mesin
+ss -tlnp | grep 8443
+grep -E "Webhook server listening|webhook mode" ~/.hermes/logs/gateway.log | tail -2
+```
 
 ## Pitfalls
 
@@ -124,6 +153,8 @@ Polling jadi mode default kalau `TELEGRAM_WEBHOOK_URL` tidak diset.
 - **URL port itu publik.** Secret token adalah satu-satunya pelindung — pakai random hex string yang kuat.
 - **Satu port per mesin.** Kalau mau pasang bot kedua di mesin yang sama, pakai port beda (misal 8444).
 - **Webhook vs cron heartbeat.** Jangan pasang keepalive cron barengan webhook — webhook sudah otomatis bangunin mesin pas ada chat.
+- **Gateway harus autostart.** Unit `hermes-gateway.service` (systemd user) wajib `enabled` **dan** akun punya `Linger=yes`; kalau tidak, mesin hidup setelah start tapi bot tetap bisu. Cek: `systemctl --user is-enabled hermes-gateway.service` dan `loginctl show-user $USER | grep Linger`.
+- **CLI `instabox` tidak ada di dalam sandbox.** Kalau harus bekerja dari dalam mesin, pakai HTTP API: `https://api.instabox.sh/v1/...` + header `X-API-Key` (`/machines`, `/machines/{id}/ports`, `/machines/{id}/exec`, `/machines/{id}/start`).
 
 ## Quick Reference
 
@@ -139,6 +170,9 @@ instabox-port unpublish 8443
 
 # Cek status webhook (dari Telegram)
 curl -s "https://api.telegram.org/bot${TOKEN}/getWebhookInfo" | jq .
+
+# Cek sehat: 405 = webhook hidup, 502 = belum listen, 503 = mesin stop/pause manual
+curl -s -o /dev/null -w '%{http_code}\n' https://8443-<machine-id>.instabox.tech/telegram
 
 # Hapus webhook
 curl -s -X POST "https://api.telegram.org/bot${TOKEN}/deleteWebhook"
